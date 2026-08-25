@@ -1,8 +1,6 @@
 // src/components/Dashboard.tsx
 import { useState, useEffect, useCallback, useRef, type FormEvent, type ChangeEvent } from 'react';
 import type { StudySession, SubjectCategory } from '../types/domain';
-import { storageService } from '../services/storageService';
-import { syncEngine } from '../services/syncEngine';
 import { useAuth } from '../hooks/useAuth';
 import { supabase } from '../services/supabase';
 import { AuthModal } from './AuthModal';
@@ -27,7 +25,8 @@ import {
   Calendar,
   X,
   Save,
-  Camera
+  Camera,
+  RefreshCw
 } from 'lucide-react';
 
 const CATEGORY_OPTIONS: { value: SubjectCategory; label: string }[] = [
@@ -62,6 +61,7 @@ export function Dashboard() {
   const [currentUsername, setCurrentUsername] = useState<string>('');
   const [currentAvatarUrl, setCurrentAvatarUrl] = useState<string | null>(null);
   const [uploadingAvatar, setUploadingAvatar] = useState(false);
+  const [isSyncing, setIsSyncing] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   const [history, setHistory] = useState<StudySession[]>([]);
@@ -87,30 +87,62 @@ export function Dashboard() {
     }
   }, [profile]);
 
-  const loadHistory = useCallback(async () => {
-    const sessions = await storageService.getSessions();
-    const sorted = [...sessions].sort(
-      (a, b) => new Date(b.startTime).getTime() - new Date(a.startTime).getTime()
-    );
-    setHistory(sorted);
+  // Carrega apenas as sessões do usuário autenticado diretamente do Supabase
+  const loadHistory = useCallback(async (currentUserId?: string) => {
+    if (!currentUserId) {
+      setHistory([]);
+      setTotalToday(0);
+      return;
+    }
 
-    const todayStr = new Date().toDateString();
-    const todaySeconds = sorted
-      .filter((s) => new Date(s.startTime).toDateString() === todayStr)
-      .reduce((acc, curr) => acc + curr.durationSeconds, 0);
+    try {
+      setIsSyncing(true);
+      const { data, error } = await supabase
+        .from('study_sessions')
+        .select('*')
+        .eq('user_id', currentUserId)
+        .order('started_at', { ascending: false });
 
-    setTotalToday(todaySeconds);
+      if (error) throw error;
+
+      const userSessions: StudySession[] = (data || []).map((s: any) => ({
+        id: s.id,
+        userId: s.user_id,
+        subject: s.subject,
+        category: s.category,
+        startTime: s.started_at,
+        endTime: s.ended_at,
+        durationSeconds: s.duration_seconds,
+        status: s.status,
+        notes: s.notes,
+        syncStatus: 'SYNCED',
+        createdAt: s.created_at,
+        updatedAt: s.updated_at
+      }));
+
+      setHistory(userSessions);
+
+      // Calcular tempo de hoje
+      const todayStr = new Date().toDateString();
+      const todaySeconds = userSessions
+        .filter((s) => new Date(s.startTime).toDateString() === todayStr)
+        .reduce((acc, curr) => acc + curr.durationSeconds, 0);
+
+      setTotalToday(todaySeconds);
+    } catch (err) {
+      console.error('Erro ao carregar histórico do usuário:', err);
+    } finally {
+      setIsSyncing(false);
+    }
   }, []);
 
+  // Recarrega o histórico sempre que o estado do usuário muda (login/logout)
   useEffect(() => {
-    void loadHistory();
-  }, [loadHistory]);
-
-  useEffect(() => {
-    if (user) {
-      void syncEngine.syncPendingSessions(user.id).then(() => loadHistory());
-      const cleanup = syncEngine.setupAutoSync(user.id);
-      return cleanup;
+    if (user?.id) {
+      void loadHistory(user.id);
+    } else {
+      setHistory([]);
+      setTotalToday(0);
     }
   }, [user, loadHistory]);
 
@@ -129,9 +161,7 @@ export function Dashboard() {
         .from('avatars')
         .upload(filePath, file, { upsert: true });
 
-      if (uploadError) {
-        throw uploadError;
-      }
+      if (uploadError) throw uploadError;
 
       const { data } = supabase.storage.from('avatars').getPublicUrl(filePath);
 
@@ -185,8 +215,6 @@ export function Dashboard() {
       return;
     }
 
-    await storageService.deleteSession(sessionId);
-
     if (user) {
       await supabase.from('study_sessions').delete().eq('id', sessionId);
     }
@@ -195,7 +223,9 @@ export function Dashboard() {
       resetForm();
     }
 
-    await loadHistory();
+    if (user?.id) {
+      await loadHistory(user.id);
+    }
     setSuccessMessage('Registro excluído com sucesso.');
     setTimeout(() => setSuccessMessage(null), 3000);
   };
@@ -204,6 +234,12 @@ export function Dashboard() {
     e.preventDefault();
     setErrorMessage(null);
     setSuccessMessage(null);
+
+    if (!user) {
+      setErrorMessage('Faça login para registrar e salvar seus estudos.');
+      setIsAuthModalOpen(true);
+      return;
+    }
 
     const hours = parseInt(hoursInput, 10) || 0;
     const minutes = parseInt(minutesInput, 10) || 0;
@@ -228,44 +264,30 @@ export function Dashboard() {
     const startTime = chosenDate.toISOString();
     const endTime = new Date(chosenDate.getTime() + totalDurationSeconds * 1000).toISOString();
 
-    const sessionPayload: StudySession = {
+    const supabasePayload = {
       id: editingSessionId || crypto.randomUUID(),
-      userId: user?.id || 'local-user',
+      user_id: user.id,
       subject: finalSubject,
       category: categoryInput,
-      startTime,
-      endTime,
-      durationSeconds: totalDurationSeconds,
+      started_at: startTime,
+      ended_at: endTime,
+      duration_seconds: totalDurationSeconds,
       status: 'IDLE',
       notes: null,
-      syncStatus: 'PENDING',
-      createdAt: editingSessionId
-        ? history.find((s) => s.id === editingSessionId)?.createdAt || new Date().toISOString()
-        : new Date().toISOString(),
-      updatedAt: new Date().toISOString()
+      updated_at: new Date().toISOString()
     };
 
-    await storageService.saveSession(sessionPayload);
-    await loadHistory();
+    const { error: upsertError } = await supabase
+      .from('study_sessions')
+      .upsert(supabasePayload, { onConflict: 'id' });
 
-    if (user) {
-      const supabasePayload = {
-        id: sessionPayload.id,
-        user_id: user.id,
-        subject: sessionPayload.subject,
-        category: sessionPayload.category,
-        started_at: sessionPayload.startTime,
-        ended_at: sessionPayload.endTime,
-        duration_seconds: sessionPayload.durationSeconds,
-        status: sessionPayload.status,
-        notes: sessionPayload.notes,
-        updated_at: sessionPayload.updatedAt
-      };
-
-      await supabase.from('study_sessions').upsert(supabasePayload, { onConflict: 'id' });
-      await syncEngine.syncPendingSessions(user.id);
-      await loadHistory();
+    if (upsertError) {
+      console.error('Erro ao salvar no Supabase:', upsertError);
+      setErrorMessage('Erro ao salvar sessão de estudo. Tente novamente.');
+      return;
     }
+
+    await loadHistory(user.id);
 
     const wasEditing = Boolean(editingSessionId);
     resetForm();
@@ -303,7 +325,6 @@ export function Dashboard() {
         
         {/* Header Responsivo */}
         <header className="bg-slate-900 p-4 sm:p-6 rounded-2xl sm:rounded-3xl border border-slate-800 shadow-sm space-y-4">
-          {/* Linha 1: Título e Perfil do Usuário */}
           <div className="flex items-center justify-between gap-2">
             <div className="flex items-center gap-2.5">
               <div className="p-2 sm:p-2.5 bg-indigo-500/20 text-indigo-400 rounded-xl flex-shrink-0">
@@ -319,14 +340,12 @@ export function Dashboard() {
               </div>
             </div>
 
-            {/* Usuário / Login */}
             {authLoading ? (
               <div className="h-9 w-9 flex items-center justify-center">
                 <Loader2 className="animate-spin text-slate-500" size={18} />
               </div>
             ) : user ? (
               <div className="flex items-center gap-1.5 sm:gap-2.5 bg-slate-950 px-2.5 py-1.5 sm:px-3 sm:py-2 rounded-xl border border-slate-800 flex-shrink-0">
-                {/* Foto de Perfil */}
                 <div
                   onClick={() => fileInputRef.current?.click()}
                   className="relative group cursor-pointer flex-shrink-0"
@@ -353,7 +372,6 @@ export function Dashboard() {
                   />
                 </div>
 
-                {/* Nome com clique para editar */}
                 <button
                   onClick={() => setIsProfileModalOpen(true)}
                   className="text-xs sm:text-sm font-medium text-slate-200 hover:text-indigo-400 flex items-center gap-1 transition-colors cursor-pointer"
@@ -365,14 +383,15 @@ export function Dashboard() {
                   <Pencil size={11} className="text-slate-500 hover:text-indigo-400 flex-shrink-0" />
                 </button>
 
-                {/* Streak */}
                 <span className="text-[10px] sm:text-xs bg-amber-500/10 text-amber-400 border border-amber-500/20 px-1.5 py-0.5 rounded-full font-bold flex items-center gap-0.5 flex-shrink-0">
                   🔥 {profile?.currentStreak ?? 0}
                 </span>
 
-                {/* Logout */}
                 <button
-                  onClick={() => signOut()}
+                  onClick={() => {
+                    localStorage.removeItem('studyrats_sessions');
+                    signOut();
+                  }}
                   className="text-slate-500 hover:text-rose-400 p-1 transition-colors cursor-pointer flex-shrink-0"
                   title="Sair da conta"
                 >
@@ -390,9 +409,8 @@ export function Dashboard() {
             )}
           </div>
 
-          {/* Linha 2: Estatística Estudado Hoje + Ações de Grupos e Ranking */}
+          {/* Estatística Estudado Hoje + Ações */}
           <div className="flex items-center justify-between gap-2 pt-2 border-t border-slate-800/80">
-            {/* Card Estudado Hoje */}
             <div className="flex items-center gap-2 bg-slate-950 px-3 py-1.5 sm:px-3.5 sm:py-2 rounded-xl border border-slate-800 flex-1">
               <Activity className="text-indigo-400 flex-shrink-0" size={16} />
               <div>
@@ -403,13 +421,11 @@ export function Dashboard() {
               </div>
             </div>
 
-            {/* Botões Grupos e Ranking */}
             {user && (
               <div className="flex items-center gap-1.5 sm:gap-2 flex-1 justify-end">
                 <button
                   onClick={() => setIsGroupModalOpen(true)}
                   className="flex-1 sm:flex-initial bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 px-3 py-2 rounded-xl font-semibold flex items-center justify-center gap-1.5 transition-colors cursor-pointer text-xs"
-                  title="Gerenciar Grupos"
                 >
                   <Users size={15} />
                   <span>Grupos</span>
@@ -418,7 +434,6 @@ export function Dashboard() {
                 <button
                   onClick={() => setIsLeaderboardOpen(true)}
                   className="flex-1 sm:flex-initial bg-indigo-500/10 text-indigo-400 hover:bg-indigo-500/20 border border-indigo-500/20 px-3 py-2 rounded-xl font-semibold flex items-center justify-center gap-1.5 transition-colors cursor-pointer text-xs"
-                  title="Ver Ranking"
                 >
                   <Trophy size={15} />
                   <span>Ranking</span>
@@ -428,9 +443,8 @@ export function Dashboard() {
           </div>
         </header>
 
-        {/* Layout Principal */}
+        {/* Formulário & Histórico */}
         <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-          {/* Formulário de Registro / Edição */}
           <main className="lg:col-span-2">
             <div className="bg-slate-900 p-5 sm:p-7 md:p-8 rounded-3xl border border-slate-800 shadow-lg">
               <div className="flex items-center justify-between mb-6">
@@ -541,7 +555,6 @@ export function Dashboard() {
                   </div>
                 )}
 
-                {/* Seletores de Horas e Minutos */}
                 <div>
                   <label className="block text-xs sm:text-sm font-medium text-slate-300 mb-1.5">
                     Tempo Dedicado
@@ -610,15 +623,20 @@ export function Dashboard() {
                 <Clock className="text-slate-400" size={18} />
                 <h3 className="text-base sm:text-lg font-semibold text-white">Histórico Recente</h3>
               </div>
-              <span className="text-xs text-slate-500 font-medium">
-                {history.length} {history.length === 1 ? 'registro' : 'registros'}
-              </span>
+              <div className="flex items-center gap-2">
+                {isSyncing && <RefreshCw size={12} className="animate-spin text-indigo-400" />}
+                <span className="text-xs text-slate-500 font-medium">
+                  {history.length} {history.length === 1 ? 'registro' : 'registros'}
+                </span>
+              </div>
             </div>
 
             <div className="flex-1 overflow-y-auto pr-1 space-y-2.5 custom-scrollbar">
               {history.length === 0 ? (
                 <div className="text-center py-10 text-slate-500">
-                  <p className="text-sm">Nenhum estudo registrado ainda.</p>
+                  <p className="text-sm">
+                    {user ? 'Nenhum estudo registrado ainda nesta conta.' : 'Faça login para ver seu histórico.'}
+                  </p>
                 </div>
               ) : (
                 history.map((session) => (
@@ -647,7 +665,6 @@ export function Dashboard() {
                         </div>
                       </div>
 
-                      {/* Ações de Edição e Exclusão */}
                       <div className="flex items-center gap-1 flex-shrink-0 ml-1">
                         <button
                           onClick={() => handleEdit(session)}
@@ -710,7 +727,6 @@ export function Dashboard() {
         />
       )}
 
-      {/* Scrollbar estilizada */}
       <style>{`
         .custom-scrollbar::-webkit-scrollbar {
           width: 5px;
