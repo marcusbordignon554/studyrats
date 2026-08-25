@@ -52,7 +52,14 @@ export function AuthModal({ isOpen, onClose }: AuthModalProps) {
         setMode('LOGIN');
       }
     } catch (err: any) {
-      setErrorMessage(err.message || 'Ocorreu um erro. Verifique seus dados.');
+      const msg = (err && err.message) ? String(err.message) : '';
+      const lower = msg.toLowerCase();
+      if (lower.includes('rate limit') || lower.includes('email rate')) {
+        // Friendly message for the common Supabase rate limit on confirmation emails
+        setErrorMessage('Muitos e-mails enviados. Aguarde até 1 hora e tente novamente.');
+      } else {
+        setErrorMessage(msg || 'Ocorreu um erro. Verifique seus dados.');
+      }
     } finally {
       setLoading(false);
     }

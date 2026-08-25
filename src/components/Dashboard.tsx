@@ -276,6 +276,14 @@ export function Dashboard() {
       return;
     }
 
+    // Bloquear salvamento se o usuário não pertence a nenhum grupo
+    if (userGroups.length === 0) {
+      setErrorMessage('Você precisa entrar em um grupo antes de salvar registros de estudo.');
+      // Abrir modal de grupos para facilitar a ação do usuário
+      setIsGroupModalOpen(true);
+      return;
+    }
+
     const hours = parseInt(hoursInput, 10) || 0;
     const minutes = parseInt(minutesInput, 10) || 0;
     const totalDurationSeconds = hours * 3600 + minutes * 60;
