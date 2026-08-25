@@ -1,4 +1,3 @@
-readme_content = """# StudyRats 🐀
 > **Acompanhe seu Progresso, Dispute com Seus Amigos!**
 
 O **StudyRats** é uma plataforma completa e moderna voltada para a produtividade e a gamificação da rotina de estudos. Com ele, você registra detalhadamente o tempo dedicado a cada matéria, cria grupos fechados com códigos de convite, compete no ranking semanal e mantém sua constância através de ofensivas diárias (*streaks*).
