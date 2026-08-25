@@ -56,32 +56,94 @@ export const groupService = {
   // Listar grupos do usuário com seu respectivo cargo
   async getUserGroups(userId: string): Promise<StudyGroup[]> {
     try {
-      const { data, error } = await supabase
+      // 1) Busca os registros em group_members para obter group_ids e roles
+      const { data: memberRows, error: memberErr } = await supabase
         .from('group_members')
-        .select(`
-          role,
-          study_groups (
-            id,
-            name,
-            invite_code,
-            created_by,
-            created_at
-          )
-        `)
+        .select('group_id, role')
         .eq('user_id', userId);
 
-      if (error || !data) return [];
+      if (memberErr || !memberRows || memberRows.length === 0) return [];
 
-      return data
-        .filter((item) => item.study_groups !== null)
-        .map((item: any) => ({
-          id: item.study_groups.id,
-          name: item.study_groups.name,
-          inviteCode: item.study_groups.invite_code,
-          createdBy: item.study_groups.created_by,
-          createdAt: item.study_groups.created_at,
-          userRole: item.role as 'ADMIN' | 'MEMBER'
-        }));
+      const groupIds = Array.from(new Set(memberRows.map((r: any) => r.group_id).filter(Boolean)));
+
+      if (groupIds.length === 0) return [];
+
+      // 2) Busca as informações dos grupos
+      const { data: groupsData, error: groupsErr } = await supabase
+        .from('study_groups')
+        .select('id, name, invite_code, created_by, created_at')
+        .in('id', groupIds);
+
+      if (groupsErr || !groupsData) return [];
+
+      // 3) Mapear role por grupo_id
+      const roleMap = new Map<string, string>();
+      memberRows.forEach((r: any) => {
+        if (r && r.group_id) roleMap.set(r.group_id, r.role);
+      });
+
+      // 4) Buscar membros para todos os grupos em uma única query para performance
+      const { data: allMemberRows, error: allMembersErr } = await supabase
+        .from('group_members')
+        .select('group_id, user_id, role, joined_at')
+        .in('group_id', groupIds)
+        .order('joined_at', { ascending: true });
+
+      if (allMembersErr) {
+        console.error('Erro ao buscar membros para grupos:', allMembersErr);
+      }
+
+      const userIds = Array.from(new Set((allMemberRows || []).map((r: any) => r.user_id).filter(Boolean)));
+
+      // 5) Buscar perfis dos usuários encontrados
+      const { data: profilesRows, error: profilesErr } = await supabase
+        .from('profiles')
+        .select('id, username, avatar_url')
+        .in('id', userIds);
+
+      if (profilesErr) {
+        console.error('Erro ao buscar perfis:', profilesErr);
+      }
+
+      const profileMap = new Map<string, any>((profilesRows || []).map((p: any) => [p.id, p]));
+
+      // 6) Montar um map group_id -> members[]
+      const membersByGroup = new Map<string, any[]>();
+      (allMemberRows || []).forEach((mr: any) => {
+        const prof = profileMap.get(mr.user_id);
+        const memberObj = {
+          // Alguns schemas não possuem coluna 'id' em group_members — gerar um id sintético
+          id: `${mr.user_id}-${mr.group_id}`,
+          groupId: mr.group_id,
+          userId: mr.user_id,
+          username: prof?.username || 'Estudante',
+          avatarUrl: prof?.avatar_url || null,
+          role: (mr.role as 'ADMIN' | 'MEMBER') || 'MEMBER',
+          isCreator: mr.user_id === undefined ? false : false,
+          joinedAt: mr.joined_at || mr.created_at || mr.updated_at || null
+        };
+        if (!membersByGroup.has(mr.group_id)) membersByGroup.set(mr.group_id, []);
+        const groupArr = membersByGroup.get(mr.group_id) as any[] | undefined;
+        if (groupArr) {
+          groupArr.push(memberObj);
+        } else {
+          // fallback (shouldn't happen because we just set it), but keep robust
+          membersByGroup.set(mr.group_id, [memberObj]);
+        }
+      });
+
+      // 7) Montar objetos finais
+      const groupsWithMembers = groupsData.map((g: any) => ({
+        id: g.id,
+        name: g.name,
+        inviteCode: g.invite_code,
+        createdBy: g.created_by,
+        createdAt: g.created_at,
+        userRole: (roleMap.get(g.id) as 'ADMIN' | 'MEMBER') || 'MEMBER',
+        members: membersByGroup.get(g.id) || []
+      }));
+
+      return groupsWithMembers;
     } catch (err) {
       console.error('Erro ao buscar grupos:', err);
       return [];
@@ -151,34 +213,47 @@ export const groupService = {
   // Obter todos os membros de um grupo com foto e cargo
   async getGroupMembers(groupId: string, createdBy?: string): Promise<GroupMember[]> {
     try {
-      const { data, error } = await supabase
+      console.log('Buscando membros para o grupo ID:', groupId);
+
+      const { data: memberRows, error: memberErr } = await supabase
         .from('group_members')
-        .select(`
-          id,
-          group_id,
-          user_id,
-          role,
-          joined_at,
-          profiles (
-            username,
-            avatar_url
-          )
-        `)
-        .eq('group_id', groupId)
-        .order('joined_at', { ascending: true });
+        .select('group_id, user_id, role, joined_at')
+        .eq('group_id', groupId);
 
-      if (error || !data) return [];
+      if (memberErr) {
+        console.error('Erro do Supabase ao buscar membros:', memberErr);
+        return [];
+      }
 
-      return data.map((item: any) => ({
-        id: item.id,
+      if (!memberRows || memberRows.length === 0) return [];
+
+      const userIds = memberRows.map((m: any) => m.user_id).filter(Boolean);
+
+      const { data: profiles } = await supabase
+        .from('profiles')
+        .select('id, username, avatar_url')
+        .in('id', userIds);
+
+      const profileMap = new Map<string, { username?: string; avatar_url?: string | null }>();
+      (profiles || []).forEach((p: any) => {
+        profileMap.set(p.id, p);
+      });
+
+      return memberRows.map((item: any) => {
+        const prof = profileMap.get(item.user_id);
+        return {
+        // gerar id sintético quando não houver
+        id: `${item.user_id}-${item.group_id}`,
         groupId: item.group_id,
         userId: item.user_id,
-        username: item.profiles?.username || 'Estudante',
-        avatarUrl: item.profiles?.avatar_url || null,
+        username: prof?.username || 'Estudante',
+        avatarUrl: prof?.avatar_url || null,
         role: (item.role as 'ADMIN' | 'MEMBER') || 'MEMBER',
         isCreator: item.user_id === createdBy,
-        joinedAt: item.joined_at
-      }));
+        // joined_at pode ter nomes diferentes dependendo do schema (joined_at, created_at). Usar fallback
+        joinedAt: item.joined_at || item.created_at || item.updated_at || null
+      };
+      });
     } catch (err) {
       console.error('Erro ao buscar membros:', err);
       return [];

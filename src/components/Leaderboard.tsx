@@ -2,6 +2,7 @@
 import { useState, useEffect, useCallback } from 'react';
 import { supabase } from '../services/supabase';
 import { Avatar } from './Avatar';
+import { groupService } from '../services/groupService';
 import {
   Trophy,
   Users,
@@ -61,28 +62,12 @@ export function Leaderboard({ userId, onClose, onOpenGroups }: LeaderboardProps)
   const [loadingGroups, setLoadingGroups] = useState(true);
   const [loadingBoard, setLoadingBoard] = useState(false);
 
-  // 1. Carregar grupos do usuário logado
   const loadGroups = useCallback(async () => {
     try {
       setLoadingGroups(true);
-      const { data, error } = await supabase
-        .from('group_members')
-        .select(`
-          group_id,
-          study_groups (
-            id,
-            name,
-            invite_code
-          )
-        `)
-        .eq('user_id', userId);
-
-      if (error) throw error;
-
-      const formattedGroups: GroupOption[] = (data || [])
-        .map((item: any) => item.study_groups)
-        .filter(Boolean);
-
+      // usar groupService para obter grupos de forma robusta
+      const groupsData = await groupService.getUserGroups(userId);
+      const formattedGroups: GroupOption[] = (groupsData || []).map((g) => ({ id: g.id, name: g.name, invite_code: g.inviteCode }));
       setGroups(formattedGroups);
       if (formattedGroups.length > 0) {
         setSelectedGroupId((prev) => prev || formattedGroups[0].id);
@@ -98,45 +83,23 @@ export function Leaderboard({ userId, onClose, onOpenGroups }: LeaderboardProps)
     void loadGroups();
   }, [loadGroups]);
 
-  // 2. Carregar membros e sessões detalhadas dos últimos 7 dias
   const loadLeaderboard = useCallback(async (groupId: string) => {
     try {
       setLoadingBoard(true);
 
-      // Buscar os membros do grupo selecionado
-      const { data: memberData, error: memberError } = await supabase
-        .from('group_members')
-        .select(`
-          user_id,
-          profiles (
-            id,
-            username,
-            avatar_url
-          )
-        `)
-        .eq('group_id', groupId);
+      // Usar groupService para buscar membros (mais robusto)
+      const members = await groupService.getGroupMembers(groupId);
 
-      if (memberError) throw memberError;
-
-      const members = (memberData || []).map((m: any) => ({
-        id: m.user_id,
-        username: m.profiles?.username || 'Usuário',
-        avatarUrl: m.profiles?.avatar_url || null
-      }));
-
-      if (members.length === 0) {
+      if (!members || members.length === 0) {
         setLeaderboard([]);
         return;
       }
 
-      const memberIds = members.map((m) => m.id);
-
-      // Data de corte: 7 dias atrás
+      const memberIds = members.map((m) => m.userId);
       const sevenDaysAgo = new Date();
       sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 7);
       sevenDaysAgo.setHours(0, 0, 0, 0);
 
-      // Buscar todas as sessões registradas pelos membros no período
       const { data: sessions, error: sessionsError } = await supabase
         .from('study_sessions')
         .select('id, user_id, subject, category, started_at, duration_seconds')
@@ -146,7 +109,6 @@ export function Leaderboard({ userId, onClose, onOpenGroups }: LeaderboardProps)
 
       if (sessionsError) throw sessionsError;
 
-      // Mapear sessões e acumular tempo por participante
       const sessionMap: Record<string, MemberSessionDetail[]> = {};
       const durationMap: Record<string, number> = {};
 
@@ -169,7 +131,6 @@ export function Leaderboard({ userId, onClose, onOpenGroups }: LeaderboardProps)
         });
       });
 
-      // Montar ranking final
       const entries: LeaderboardEntry[] = members.map((m) => ({
         userId: m.id,
         username: m.username,
@@ -178,11 +139,10 @@ export function Leaderboard({ userId, onClose, onOpenGroups }: LeaderboardProps)
         sessions: sessionMap[m.id] || []
       }));
 
-      // Ordenar decrescente pelo tempo total
       entries.sort((a, b) => b.totalStudyTimeSeconds - a.totalStudyTimeSeconds);
       setLeaderboard(entries);
     } catch (err) {
-      console.error('Erro ao calcular ranking semanal:', err);
+      console.error('Erro ao calcular ranking:', err);
     } finally {
       setLoadingBoard(false);
     }
@@ -212,7 +172,7 @@ export function Leaderboard({ userId, onClose, onOpenGroups }: LeaderboardProps)
 
   return (
     <div className="bg-slate-900 border border-slate-800 rounded-3xl w-full max-w-2xl overflow-hidden shadow-2xl flex flex-col max-h-[90vh]">
-      {/* Cabeçalho */}
+      {/* Top Header */}
       <div className="p-5 sm:p-6 border-b border-slate-800 flex items-center justify-between">
         <div className="flex items-center gap-3">
           <div className="p-2.5 bg-amber-500/10 text-amber-400 rounded-xl border border-amber-500/20">
@@ -220,7 +180,7 @@ export function Leaderboard({ userId, onClose, onOpenGroups }: LeaderboardProps)
           </div>
           <div>
             <h2 className="text-lg sm:text-xl font-bold text-white">Ranking Semanal</h2>
-            <p className="text-xs text-slate-400">Competição dos últimos 7 dias • Toque em um participante para ver o que ele estudou</p>
+            <p className="text-xs text-slate-400">Últimos 7 dias • Toque em um participante para ver os detalhes</p>
           </div>
         </div>
 
@@ -266,12 +226,12 @@ export function Leaderboard({ userId, onClose, onOpenGroups }: LeaderboardProps)
         )}
       </div>
 
-      {/* Tabela do Ranking com Accordion */}
+      {/* Ranking */}
       <div className="flex-1 overflow-y-auto p-4 sm:p-6 custom-scrollbar">
         {loadingGroups || loadingBoard ? (
           <div className="flex flex-col items-center justify-center py-16 text-slate-500 gap-3">
             <Loader2 className="animate-spin text-indigo-400" size={28} />
-            <p className="text-xs sm:text-sm">Carregando posições e estudos...</p>
+            <p className="text-xs sm:text-sm">Carregando...</p>
           </div>
         ) : groups.length === 0 ? (
           <div className="text-center py-12 text-slate-500 space-y-3">
@@ -307,13 +267,11 @@ export function Leaderboard({ userId, onClose, onOpenGroups }: LeaderboardProps)
                       : 'bg-slate-950 border-slate-800/80'
                   }`}
                 >
-                  {/* Linha do Membro (clicável para expandir) */}
                   <div
                     onClick={() => toggleExpandUser(entry.userId)}
                     className="flex items-center justify-between p-3.5 sm:p-4 cursor-pointer hover:bg-slate-800/40 transition-colors select-none"
                   >
                     <div className="flex items-center gap-3 min-w-0 overflow-hidden">
-                      {/* Posição / Medalha */}
                       <div className="w-6 text-center font-bold text-sm flex-shrink-0">
                         {isTop1 ? (
                           <Medal className="text-amber-400 mx-auto" size={20} />
@@ -326,7 +284,6 @@ export function Leaderboard({ userId, onClose, onOpenGroups }: LeaderboardProps)
                         )}
                       </div>
 
-                      {/* Avatar */}
                       <Avatar username={entry.username} avatarUrl={entry.avatarUrl} size="md" />
 
                       <div className="min-w-0 overflow-hidden">
@@ -339,7 +296,7 @@ export function Leaderboard({ userId, onClose, onOpenGroups }: LeaderboardProps)
                           )}
                         </p>
                         <p className="text-[11px] text-slate-500 mt-0.5">
-                          {entry.sessions.length} {entry.sessions.length === 1 ? 'estudo registrado' : 'estudos registrados'}
+                          {entry.sessions.length} {entry.sessions.length === 1 ? 'estudo' : 'estudos'}
                         </p>
                       </div>
                     </div>
@@ -355,7 +312,7 @@ export function Leaderboard({ userId, onClose, onOpenGroups }: LeaderboardProps)
                     </div>
                   </div>
 
-                  {/* Sessões Expandidas ("O que você estudou?") */}
+                  {/* Sessões Expandidas */}
                   {isExpanded && (
                     <div className="p-3.5 sm:p-4 bg-slate-900/80 border-t border-slate-800/80 space-y-2 animate-in fade-in slide-in-from-top-1 duration-150">
                       <div className="flex items-center gap-1.5 text-xs font-semibold text-slate-400 mb-2">

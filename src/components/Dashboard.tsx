@@ -29,6 +29,11 @@ import {
   RefreshCw
 } from 'lucide-react';
 
+interface GroupOption {
+  id: string;
+  name: string;
+}
+
 const CATEGORY_OPTIONS: { value: SubjectCategory; label: string }[] = [
   { value: 'PROGRAMMING', label: 'Programação & TI' },
   { value: 'MATHEMATICS', label: 'Matemática' },
@@ -64,11 +69,13 @@ export function Dashboard() {
   const [isSyncing, setIsSyncing] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
+  const [userGroups, setUserGroups] = useState<GroupOption[]>([]);
   const [history, setHistory] = useState<StudySession[]>([]);
   const [totalToday, setTotalToday] = useState<number>(0);
 
   // Estados do formulário
   const [editingSessionId, setEditingSessionId] = useState<string | null>(null);
+  const [selectedGroupId, setSelectedGroupId] = useState<string>('');
   const [subjectInput, setSubjectInput] = useState<string>('');
   const [categoryInput, setCategoryInput] = useState<SubjectCategory>('PROGRAMMING');
   const [customCategoryInput, setCustomCategoryInput] = useState<string>('');
@@ -79,15 +86,51 @@ export function Dashboard() {
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
 
   useEffect(() => {
-    if (profile?.username) {
-      setCurrentUsername(profile.username);
-    }
-    if (profile?.avatarUrl) {
-      setCurrentAvatarUrl(profile.avatarUrl);
-    }
+    if (profile?.username) setCurrentUsername(profile.username);
+    if (profile?.avatarUrl) setCurrentAvatarUrl(profile.avatarUrl);
   }, [profile]);
 
-  // Carrega apenas as sessões do usuário autenticado diretamente do Supabase
+  // Carregar grupos do usuário
+  const loadUserGroups = useCallback(async (currentUserId: string) => {
+    try {
+      // 1. Busca os IDs dos grupos onde o usuário é membro
+      const { data: memberRows, error: memberErr } = await supabase
+        .from('group_members')
+        .select('group_id')
+        .eq('user_id', currentUserId);
+
+      if (memberErr) throw memberErr;
+
+      const groupIds = (memberRows || []).map((m: any) => m.group_id).filter(Boolean);
+
+      if (groupIds.length === 0) {
+        setUserGroups([]);
+        return;
+      }
+
+      // 2. Busca os nomes e dados dos grupos correspondentes
+      const { data: groupsData, error: groupsErr } = await supabase
+        .from('study_groups')
+        .select('id, name')
+        .in('id', groupIds);
+
+      if (groupsErr) throw groupsErr;
+
+      const formatted: GroupOption[] = (groupsData || []).map((g: any) => ({
+        id: g.id,
+        name: g.name
+      }));
+
+      setUserGroups(formatted);
+      if (formatted.length > 0 && !selectedGroupId) {
+        setSelectedGroupId(formatted[0].id);
+      }
+    } catch (err) {
+      console.error('Erro ao carregar grupos no dashboard:', err);
+    }
+  }, [selectedGroupId]);
+
+  // Carregar histórico
   const loadHistory = useCallback(async (currentUserId?: string) => {
     if (!currentUserId) {
       setHistory([]);
@@ -122,7 +165,6 @@ export function Dashboard() {
 
       setHistory(userSessions);
 
-      // Calcular tempo de hoje
       const todayStr = new Date().toDateString();
       const todaySeconds = userSessions
         .filter((s) => new Date(s.startTime).toDateString() === todayStr)
@@ -130,28 +172,27 @@ export function Dashboard() {
 
       setTotalToday(todaySeconds);
     } catch (err) {
-      console.error('Erro ao carregar histórico do usuário:', err);
+      console.error('Erro ao carregar histórico:', err);
     } finally {
       setIsSyncing(false);
     }
   }, []);
 
-  // Recarrega o histórico sempre que o estado do usuário muda (login/logout)
   useEffect(() => {
     if (user?.id) {
       void loadHistory(user.id);
+      void loadUserGroups(user.id);
     } else {
       setHistory([]);
+      setUserGroups([]);
       setTotalToday(0);
     }
-  }, [user, loadHistory]);
+  }, [user, loadHistory, loadUserGroups]);
 
   const handleAvatarUpload = async (event: ChangeEvent<HTMLInputElement>) => {
     try {
       setUploadingAvatar(true);
-      if (!event.target.files || event.target.files.length === 0 || !user) {
-        return;
-      }
+      if (!event.target.files || event.target.files.length === 0 || !user) return;
 
       const file = event.target.files[0];
       const fileExt = file.name.split('.').pop();
@@ -175,7 +216,7 @@ export function Dashboard() {
       setTimeout(() => setSuccessMessage(null), 3000);
     } catch (err) {
       console.error('Erro ao enviar avatar:', err);
-      setErrorMessage('Erro ao enviar imagem. Máximo 2MB.');
+      setErrorMessage('Erro ao enviar imagem.');
       setTimeout(() => setErrorMessage(null), 4000);
     } finally {
       setUploadingAvatar(false);
@@ -211,22 +252,16 @@ export function Dashboard() {
   };
 
   const handleDelete = async (sessionId: string) => {
-    if (!window.confirm('Tem certeza de que deseja excluir este registro de estudo?')) {
-      return;
-    }
+    if (!window.confirm('Deseja excluir este registro de estudo?')) return;
 
     if (user) {
       await supabase.from('study_sessions').delete().eq('id', sessionId);
     }
 
-    if (editingSessionId === sessionId) {
-      resetForm();
-    }
+    if (editingSessionId === sessionId) resetForm();
+    if (user?.id) await loadHistory(user.id);
 
-    if (user?.id) {
-      await loadHistory(user.id);
-    }
-    setSuccessMessage('Registro excluído com sucesso.');
+    setSuccessMessage('Registro excluído.');
     setTimeout(() => setSuccessMessage(null), 3000);
   };
 
@@ -236,7 +271,7 @@ export function Dashboard() {
     setSuccessMessage(null);
 
     if (!user) {
-      setErrorMessage('Faça login para registrar e salvar seus estudos.');
+      setErrorMessage('Faça login para salvar seus estudos.');
       setIsAuthModalOpen(true);
       return;
     }
@@ -267,6 +302,7 @@ export function Dashboard() {
     const supabasePayload = {
       id: editingSessionId || crypto.randomUUID(),
       user_id: user.id,
+      group_id: selectedGroupId || null,
       subject: finalSubject,
       category: categoryInput,
       started_at: startTime,
@@ -283,7 +319,7 @@ export function Dashboard() {
 
     if (upsertError) {
       console.error('Erro ao salvar no Supabase:', upsertError);
-      setErrorMessage('Erro ao salvar sessão de estudo. Tente novamente.');
+      setErrorMessage('Erro ao salvar sessão de estudo.');
       return;
     }
 
@@ -294,7 +330,7 @@ export function Dashboard() {
     setSuccessMessage(
       wasEditing
         ? 'Estudo atualizado com sucesso!'
-        : `Sessão de ${hours > 0 ? `${hours}h ` : ''}${minutes}m registrada com sucesso!`
+        : `Sessão de ${hours > 0 ? `${hours}h ` : ''}${minutes}m registrada!`
     );
 
     setTimeout(() => setSuccessMessage(null), 4000);
@@ -323,7 +359,7 @@ export function Dashboard() {
     <div className="min-h-screen bg-slate-950 text-slate-200 font-sans p-3 sm:p-6 md:p-8">
       <div className="max-w-4xl mx-auto space-y-6">
         
-        {/* Header Responsivo */}
+        {/* Header */}
         <header className="bg-slate-900 p-4 sm:p-6 rounded-2xl sm:rounded-3xl border border-slate-800 shadow-sm space-y-4">
           <div className="flex items-center justify-between gap-2">
             <div className="flex items-center gap-2.5">
@@ -349,7 +385,7 @@ export function Dashboard() {
                 <div
                   onClick={() => fileInputRef.current?.click()}
                   className="relative group cursor-pointer flex-shrink-0"
-                  title="Clique para trocar sua foto de perfil"
+                  title="Trocar foto de perfil"
                 >
                   <Avatar
                     username={currentUsername || profile?.username || 'Usuário'}
@@ -375,7 +411,7 @@ export function Dashboard() {
                 <button
                   onClick={() => setIsProfileModalOpen(true)}
                   className="text-xs sm:text-sm font-medium text-slate-200 hover:text-indigo-400 flex items-center gap-1 transition-colors cursor-pointer"
-                  title="Clique para mudar seu nome de usuário"
+                  title="Alterar nome"
                 >
                   <span className="max-w-[70px] sm:max-w-[100px] truncate font-semibold">
                     {currentUsername || profile?.username || 'Usuário'}
@@ -388,12 +424,9 @@ export function Dashboard() {
                 </span>
 
                 <button
-                  onClick={() => {
-                    localStorage.removeItem('studyrats_sessions');
-                    signOut();
-                  }}
+                  onClick={() => signOut()}
                   className="text-slate-500 hover:text-rose-400 p-1 transition-colors cursor-pointer flex-shrink-0"
-                  title="Sair da conta"
+                  title="Sair"
                 >
                   <LogOut size={15} />
                 </button>
@@ -409,7 +442,6 @@ export function Dashboard() {
             )}
           </div>
 
-          {/* Estatística Estudado Hoje + Ações */}
           <div className="flex items-center justify-between gap-2 pt-2 border-t border-slate-800/80">
             <div className="flex items-center gap-2 bg-slate-950 px-3 py-1.5 sm:px-3.5 sm:py-2 rounded-xl border border-slate-800 flex-1">
               <Activity className="text-indigo-400 flex-shrink-0" size={16} />
@@ -443,7 +475,7 @@ export function Dashboard() {
           </div>
         </header>
 
-        {/* Formulário & Histórico */}
+        {/* Formulário e Histórico */}
         <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
           <main className="lg:col-span-2">
             <div className="bg-slate-900 p-5 sm:p-7 md:p-8 rounded-3xl border border-slate-800 shadow-lg">
@@ -465,7 +497,7 @@ export function Dashboard() {
                   <p className="text-slate-400 text-xs sm:text-sm mt-0.5">
                     {editingSessionId
                       ? 'Altere os dados da sessão selecionada.'
-                      : 'Adicione a data, conteúdo e duração dos seus estudos.'}
+                      : 'Adicione a data, conteúdo, grupo e duração dos seus estudos.'}
                   </p>
                 </div>
 
@@ -496,6 +528,26 @@ export function Dashboard() {
               )}
 
               <form onSubmit={handleSubmit} className="space-y-4 sm:space-y-5">
+                {/* Seletor de Grupo de Estudo */}
+                <div>
+                  <label className="block text-xs sm:text-sm font-medium text-slate-300 mb-1.5 flex items-center gap-1.5">
+                    <Users size={14} className="text-indigo-400" />
+                    Grupo de Estudo
+                  </label>
+                  <select
+                    value={selectedGroupId}
+                    onChange={(e) => setSelectedGroupId(e.target.value)}
+                    className="w-full bg-slate-950 border border-slate-800 text-white rounded-xl px-4 py-3 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent transition-all cursor-pointer"
+                  >
+                    <option value="">Geral (Todos os meus grupos)</option>
+                    {userGroups.map((grp) => (
+                      <option key={grp.id} value={grp.id}>
+                        {grp.name}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+
                 <div>
                   <label className="block text-xs sm:text-sm font-medium text-slate-300 mb-1.5">
                     O que você estudou?
@@ -635,7 +687,7 @@ export function Dashboard() {
               {history.length === 0 ? (
                 <div className="text-center py-10 text-slate-500">
                   <p className="text-sm">
-                    {user ? 'Nenhum estudo registrado ainda nesta conta.' : 'Faça login para ver seu histórico.'}
+                    {user ? 'Nenhum estudo registrado ainda.' : 'Faça login para ver seu histórico.'}
                   </p>
                 </div>
               ) : (
@@ -669,14 +721,14 @@ export function Dashboard() {
                         <button
                           onClick={() => handleEdit(session)}
                           className="p-1.5 text-slate-500 hover:text-amber-400 hover:bg-slate-900 rounded-lg transition-colors cursor-pointer"
-                          title="Editar estudo"
+                          title="Editar"
                         >
                           <Pencil size={14} />
                         </button>
                         <button
                           onClick={() => handleDelete(session.id)}
                           className="p-1.5 text-slate-500 hover:text-rose-400 hover:bg-slate-900 rounded-lg transition-colors cursor-pointer"
-                          title="Excluir estudo"
+                          title="Excluir"
                         >
                           <Trash2 size={14} />
                         </button>
@@ -709,7 +761,10 @@ export function Dashboard() {
       {isGroupModalOpen && user && (
         <GroupModal
           isOpen={isGroupModalOpen}
-          onClose={() => setIsGroupModalOpen(false)}
+          onClose={() => {
+            setIsGroupModalOpen(false);
+            void loadUserGroups(user.id); // <--- ATUALIZA OS GRUPOS AO FECHAR O MODAL
+          }}
           userId={user.id}
         />
       )}
@@ -726,19 +781,6 @@ export function Dashboard() {
           onAvatarUpdated={(newUrl) => setCurrentAvatarUrl(newUrl)}
         />
       )}
-
-      <style>{`
-        .custom-scrollbar::-webkit-scrollbar {
-          width: 5px;
-        }
-        .custom-scrollbar::-webkit-scrollbar-track {
-          background: transparent;
-        }
-        .custom-scrollbar::-webkit-scrollbar-thumb {
-          background-color: #334155;
-          border-radius: 20px;
-        }
-      `}</style>
     </div>
   );
 }
